@@ -1,0 +1,6 @@
+.claude/
+.obsidian/
+*.swp
+*.tmp
+*~
+.DS_Store
