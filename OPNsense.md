@@ -1,29 +1,49 @@
-# OPNsense (Firewall/Router)
+# OPNsense (Firewall / Router)
 
-## What It Is
-OPNsense 26.1 — FreeBSD 14-based open-source firewall and router. Acts as the **gateway** between the isolated lab network and the internet. Replaces what a physical firewall/router would do in a real enterprise — routing, NAT, DHCP, DNS forwarding, and firewall rules in one box (UTM — Unified Threat Management).
+OPNsense — FreeBSD-based open-source firewall. Acts as the lab's gateway and inter-VLAN router. Runs as a libvirt VM with two NICs: WAN on libvirt's NAT network and a trunk on `br-lab` carrying all four lab VLANs.
 
-## How It's Built
+## VM Config
 
-| Setting | Value |
-|---|---|
-| **Install Media** | DVD ISO (not VGA or nano — see [[Build-Log]]) |
-| **OS Type** | FreeBSD 14.3 (OPNsense is FreeBSD-based) |
-| **Filesystem** | ZFS (stripe — single disk, no RAID) |
-| **RAM** | 2 GB |
-| **CPUs** | 2 |
-| **Disk** | 20 GB qcow2 (thin-provisioned) |
-| **NIC 1 (WAN)** | vtnet0 → `default` NAT network (192.168.122.0/24, DHCP from libvirt) |
-| **NIC 2 (LAN)** | vtnet1 → `lab-lan` isolated network (192.168.100.1/24, static) |
+| Setting    | Value                                                |
+|------------|------------------------------------------------------|
+| Install    | DVD ISO (not VGA / nano — see Build-Log 2026-04-08)  |
+| OS Family  | FreeBSD 14.x                                          |
+| Filesystem | ZFS stripe (single disk)                              |
+| RAM        | 4 GB                                                  |
+| vCPUs      | 4                                                     |
+| Disk       | 20 GB qcow2                                           |
+| NIC 1 WAN  | `vtnet0` → libvirt `default` NAT (192.168.122.0/24)   |
+| NIC 2 LAN  | `vtnet1` → bridge `br-lab` (trunk; untagged in XML)   |
 
-## What It Does
-- **Routes** traffic between the lab LAN (192.168.100.0/24) and the internet via NAT
-- **Firewalls** traffic between zones (WAN ↔ LAN)
-- Will provide **DHCP** for lab VMs (configured via web GUI, not yet enabled)
-- Web GUI accessible at `https://192.168.100.1` from any VM on lab-lan
-- Default creds: `root` / `opnsense`
+The trunk NIC has `<target dev='opn-trunk'/>` in its libvirt XML so the host always sees it as `opn-trunk` regardless of boot order — this is what the qemu hook keys on for VLAN persistence.
 
-## Relationships
-- Upstream: WAN side gets IP via DHCP from libvirt's default NAT network
-- Downstream: LAN side serves as default gateway for [[DC01]] and all future lab VMs
-- See [[Network]] for full topology
+## VLAN Sub-Interfaces
+
+Console option 1 (Assign interfaces) created 4 child interfaces on `vtnet1`:
+
+| Interface         | VLAN | Assignment      | IP             |
+|-------------------|------|-----------------|----------------|
+| `vtnet1_vlan10`   | 10   | LAN (MGMT)      | 10.10.10.1/24  |
+| `vtnet1_vlan20`   | 20   | OPT1 (ATTACK)   | 10.10.20.1/24  |
+| `vtnet1_vlan30`   | 30   | OPT2 (VICTIMS)  | 10.10.30.1/24  |
+| `vtnet1_vlan40`   | 40   | OPT3 (DMZ)      | 10.10.40.1/24  |
+
+Each has a Kea DHCP pool (`.100`–`.200`) and a starting allow-all firewall rule. Inter-VLAN traffic flows through OPNsense (router-on-a-stick) and can be filtered per-interface.
+
+## Verifying Isolation
+
+Phase 5 of the buildout verified VLAN isolation by adding a Block rule above the allow-all on the ATTACK interface:
+
+| Test                           | Result                                                |
+|--------------------------------|-------------------------------------------------------|
+| Cross-VLAN ping (no block)     | 3/3 success, TTL decremented 64 → 63                  |
+| Block rule applied             | 0/3 packets — surgical (gateway still reachable)      |
+| Block rule removed             | 3/3 restored                                          |
+
+Full evidence (with tcpdump output) is in `Build-Log.md` (2026-04-14 entry).
+
+## Gotchas
+
+- **"Configure address via DHCP" ≠ "Enable DHCP server"** — easy to confuse during console setup. The first makes OPNsense a DHCP client; the second makes it a server.
+- The console "Enable DHCP server on LAN" prompt starts **Dnsmasq**, which conflicts with **Kea** on port 67. Disable Dnsmasq before using Kea: `Services → Dnsmasq DNS & DHCP → uncheck Enable`.
+- Default creds (`root` / `opnsense`) are fine on an isolated lab network but must be changed before any production-adjacent use.

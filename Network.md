@@ -1,46 +1,63 @@
 # Network Architecture
 
-## Overview
-The lab uses two virtual networks in libvirt/KVM to simulate a segmented enterprise environment. [[OPNsense]] sits between them as the router/firewall.
+The lab uses a single VLAN-aware Linux bridge (`br-lab`) carrying all internal traffic as 802.1Q trunks. OPNsense sits on the trunk with one sub-interface per VLAN — router-on-a-stick.
 
-## Virtual Networks
+For the full buildout (with all the troubleshooting that got us here), see [`Build-Log.md`](./Build-Log.md). For OPNsense specifics, see [`OPNsense.md`](./OPNsense.md).
 
-### `default` (NAT)
-- **Subnet**: 192.168.122.0/24
-- **Purpose**: WAN — provides internet access via NAT through the Fedora host
-- **DHCP**: Enabled (managed by libvirt)
-- **Connected**: OPNsense WAN interface (vtnet0)
-- **Note**: This is libvirt's built-in default network. It NATs out through the host's physical NIC.
+## Topology
 
-### `lab-lan` (Isolated)
-- **Subnet**: 192.168.100.0/24
-- **Purpose**: Internal lab LAN — all lab VMs communicate here
-- **DHCP**: Disabled on libvirt side (OPNsense will handle DHCP)
-- **Mode**: Isolated — no direct path to the physical network or internet
-- **Connected**: OPNsense LAN interface (vtnet1), [[DC01]], and all future lab VMs
-
-## Why Isolated?
-The `lab-lan` network has **no forwarding** to the physical network. The only way for a VM on lab-lan to reach the internet is through OPNsense. This mirrors real network segmentation — the firewall controls all traffic in and out. If we used NAT or routed mode, VMs could bypass OPNsense entirely, defeating the purpose.
-
-## Why Disable DHCP on lab-lan?
-OPNsense is the authoritative DHCP server for the LAN. Two DHCP servers on the same subnet causes conflicts — devices wouldn't know which one to listen to. Disabling it on the libvirt side gives OPNsense full control over IP assignments, DNS, and gateway info.
-
-## Subnet Scheme
-
-| Network | Subnet | Gateway | Purpose |
-|---|---|---|---|
-| `default` (NAT) | 192.168.122.0/24 | 192.168.122.1 (libvirt) | WAN / internet access |
-| `lab-lan` (Isolated) | 192.168.100.0/24 | 192.168.100.1 (OPNsense) | Internal lab traffic |
-| Home network | 192.168.1.0/24 | 192.168.1.1 (Spectrum router) | Physical home network (avoid overlap!) |
-
-## Traffic Flow
 ```
-Lab VM (e.g., DC01) → lab-lan switch → OPNsense LAN (192.168.100.1)
-    → OPNsense WAN (192.168.122.x) → default NAT → Fedora host → Internet
+                  [ Internet / WAN ]
+                         |
+                  [ libvirt default NAT ]   <-- OPNsense WAN (vtnet0)
+                         |
+                   [   OPNsense   ]
+                         | (single trunk, 802.1Q)
+                   [    br-lab    ]          <-- VLAN-aware Linux bridge
+       __________________|__________________
+      |          |          |          |
+   VLAN 10   VLAN 20    VLAN 30    VLAN 40
+    MGMT     ATTACK     VICTIMS     DMZ
 ```
 
-## TODO
-- [ ] Enable DHCP on OPNsense LAN via web GUI
-- [ ] Move DC01 NIC from default to lab-lan
-- [ ] Configure firewall rules on OPNsense
-- [ ] Set up DNS forwarding
+## VLANs
+
+| VLAN | Name    | Subnet          | Gateway       | Hosts                              |
+|------|---------|-----------------|---------------|------------------------------------|
+| 10   | MGMT    | 10.10.10.0/24   | 10.10.10.1    | DC01 (10.10.10.10), Windows 11     |
+| 20   | ATTACK  | 10.10.20.0/24   | 10.10.20.1    | Kali Linux                         |
+| 30   | VICTIMS | 10.10.30.0/24   | 10.10.30.1    | Metasploitable2                    |
+| 40   | DMZ     | 10.10.40.0/24   | 10.10.40.1    | (planned)                          |
+
+OPNsense owns `.1` on every VLAN. Each VLAN has its own Kea DHCP pool (`.100`–`.200`). WAN sits on a separate libvirt NAT network (`192.168.122.0/24`).
+
+## Why VLANs / Router-on-a-Stick
+
+- **CCNA-aligned.** 802.1Q trunking and inter-VLAN routing are core CCNA exam topics — this lab is the textbook example.
+- **Mirrors production.** Real routers usually have one trunk to a switch carrying many VLANs; multi-NIC-per-network is rare in enterprise networks.
+- **Easy to extend.** Adding a VLAN is config-only — no new physical NICs or libvirt networks.
+
+## Persistence
+
+Bridge VLAN config doesn't survive reboots out of the box. Two pieces of automation handle it:
+
+- **NetworkManager dispatcher** (`/etc/NetworkManager/dispatcher.d/99-br-lab-vlans.sh`) — adds VLAN 10 to `br-lab self` so the host can reach MGMT
+- **libvirt qemu hook** (`/etc/libvirt/hooks/qemu`) — re-applies VLANs 10/20/30/40 to OPNsense's trunk port (`opn-trunk`) whenever OPNsense boots
+
+OPNsense's trunk port is renamed via `<target dev='opn-trunk'/>` in its libvirt XML so the hook can reliably target it across reboots regardless of vnet boot order.
+
+## Verification
+
+802.1Q tags on the wire:
+
+```bash
+sudo tcpdump -e -i br-lab "vlan and icmp"
+```
+
+Bridge VLAN map:
+
+```bash
+bridge vlan show
+```
+
+Inter-VLAN routing decrements TTL (64 → 63), so a TTL drop on a cross-VLAN ping confirms OPNsense is routing rather than the bridge switching.
